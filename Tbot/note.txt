@@ -1,0 +1,1 @@
+cd /home/tani/Desktop/jupyter-project/Tbot/backend && source venv/bin/activate && which python pip uvicorn && pip install -r requirements.txt

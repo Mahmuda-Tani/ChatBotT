@@ -7,6 +7,8 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [isOpen, setIsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [uploadedDoc, setUploadedDoc] = useState(null); // { filename, page_count, chunk_count }
+  const [useRag, setUseRag] = useState(false);
   const streamBufferRef = useRef("");
   const flushRafRef = useRef(null);
 
@@ -29,18 +31,28 @@ export default function App() {
     }
   }
 
+  function setLastAssistantSources(sources) {
+    setMessages((prev) => {
+      const updated = [...prev];
+      const last = updated[updated.length - 1];
+      if (last?.role !== "assistant") return prev;
+      updated[updated.length - 1] = { ...last, sources };
+      return updated;
+    });
+  }
+
   async function sendMessage(text) {
     const userMsg = { role: "user", content: text };
     const updatedMessages = [...messages, userMsg];
     streamBufferRef.current = "";
-    setMessages([...updatedMessages, { role: "assistant", content: "" }]);
+    setMessages([...updatedMessages, { role: "assistant", content: "", sources: [] }]);
     setIsLoading(true);
 
     try {
       const res = await fetch("http://localhost:8000/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: updatedMessages, provider }),
+        body: JSON.stringify({ messages: updatedMessages, provider, use_rag: useRag }),
       });
 
       if (!res.ok) {
@@ -67,16 +79,17 @@ export default function App() {
           if (payload === "[DONE]") continue;
 
           const parsed = JSON.parse(payload);
-          if (typeof parsed === "object" && parsed !== null && "error" in parsed) {
+
+          if (parsed?.type === "sources") {
+            setLastAssistantSources(parsed.sources);
+          } else if (parsed?.type === "text" && parsed.text) {
+            appendToLastAssistant(parsed.text);
+          } else if (parsed?.type === "error") {
             throw new Error(parsed.error);
-          }
-          if (typeof parsed === "string" && parsed) {
-            appendToLastAssistant(parsed);
           }
         }
       }
 
-      // Ensure final buffer is applied before reveal finishes.
       if (flushRafRef.current) {
         cancelAnimationFrame(flushRafRef.current);
         flushRafRef.current = null;
@@ -94,9 +107,10 @@ export default function App() {
           updated[updated.length - 1] = {
             role: "assistant",
             content: `Error: ${err.message}`,
+            sources: [],
           };
         } else {
-          updated.push({ role: "assistant", content: `Error: ${err.message}` });
+          updated.push({ role: "assistant", content: `Error: ${err.message}`, sources: [] });
         }
         return updated;
       });
@@ -105,11 +119,58 @@ export default function App() {
     }
   }
 
+  async function handleDocumentUpload(file) {
+    const formData = new FormData();
+    formData.append("file", file);
+    const res = await fetch("http://localhost:8000/upload", {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.detail || "Upload failed");
+    }
+    const data = await res.json();
+    setUploadedDoc(data);
+    setUseRag(true);
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "notice",
+        content: `"${data.filename}" uploaded (${data.page_count} pages). RAG is now active — answers will be based on this document.`,
+      },
+    ]);
+  }
+
+  async function handleDocumentRemove() {
+    const filename = uploadedDoc?.filename;
+    await fetch("http://localhost:8000/document", { method: "DELETE" });
+    setUploadedDoc(null);
+    setUseRag(false);
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "notice",
+        content: `"${filename}" was removed. The AI no longer has access to the document. Previous messages are still visible above.`,
+      },
+    ]);
+  }
+
   return (
     <div className="flex h-screen bg-gray-50">
-      <Sidebar provider={provider} onProviderChange={setProvider} />
+      <Sidebar
+        provider={provider}
+        onProviderChange={setProvider}
+        uploadedDoc={uploadedDoc}
+        useRag={useRag}
+        onUseRagChange={setUseRag}
+        onDocumentUpload={handleDocumentUpload}
+        onDocumentRemove={handleDocumentRemove}
+      />
       <main className="flex-1 flex items-center justify-center text-gray-400 text-sm">
-        Open the chat widget →
+        {uploadedDoc
+          ? `Chatting with "${uploadedDoc.filename}" — open the widget to ask questions`
+          : "Open the chat widget →"}
       </main>
       <ChatWidget
         isOpen={isOpen}
@@ -117,6 +178,8 @@ export default function App() {
         messages={messages}
         isLoading={isLoading}
         onSend={sendMessage}
+        useRag={useRag}
+        uploadedDoc={uploadedDoc}
       />
     </div>
   );

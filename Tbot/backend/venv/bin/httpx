@@ -1,4 +1,4 @@
-#!/home/tani/Desktop/jupyter-project/Tbot/backend/venv/bin/python3
+#!/home/tani/Desktop/jupyter-project/ChatBotT/Tbot/backend/venv/bin/python3.12
 # -*- coding: utf-8 -*-
 import re
 import sys

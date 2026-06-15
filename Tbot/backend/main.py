@@ -10,7 +10,14 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel
 
-from ragImplementation import clear_document, get_doc_info, process_pdf, retrieve_context
+from ragImplementation import (
+    clear_document,
+    get_all_chunks,
+    get_doc_info,
+    get_vectors_2d,
+    process_pdf,
+    retrieve_context,
+)
 
 load_dotenv()
 
@@ -101,6 +108,45 @@ async def get_document():
 async def delete_document():
     clear_document()
     return {"ok": True}
+
+
+# ---------- Debug / Inspection Routes ----------
+# These endpoints expose the internals of the ChromaDB index.
+# They are read-only — they never modify the stored data.
+# Use them to inspect chunk quality, spot bad splits, and understand
+# what the LLM will search through when a question is asked.
+
+@app.get("/debug/chunks")
+async def debug_chunks():
+    """
+    Returns every chunk stored in ChromaDB with its text, page number,
+    and position in the index. Use this to verify chunking quality.
+    """
+    chunks = get_all_chunks()
+    return {
+        "total": len(chunks),
+        "chunks": chunks,
+    }
+
+
+@app.get("/debug/vectors")
+async def debug_vectors():
+    """
+    Pulls all stored embeddings from ChromaDB, compresses them from
+    384 dimensions to 2 using t-SNE, and returns (x, y) coordinates
+    for each chunk so the frontend can render a scatter plot.
+
+    Note: t-SNE is non-trivial to compute. For large documents (500+ chunks)
+    this endpoint may take several seconds to respond.
+    """
+    try:
+        points = get_vectors_2d()
+        return {
+            "total": len(points),
+            "points": points,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/chat")

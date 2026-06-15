@@ -1,1 +1,50 @@
 cd /home/tani/Desktop/jupyter-project/Tbot/backend && source venv/bin/activate && which python pip uvicorn && pip install -r requirements.txt
+
+================================================================================
+RAG IMPLEMENTATION PROBLEMS (ragImplementation.py)
+================================================================================
+
+[CRITICAL] 1. Global State Shared Across All Users
+   - _vector_store and _doc_info are module-level globals
+   - If User A uploads doc1.pdf and User B uploads doc2.pdf, B overwrites A's store
+   - Data corruption + privacy violation with just 2 simultaneous users
+   - Fix: Session-scoped vector stores identified by session ID
+
+[CRITICAL] 2. Data Lost on Every Server Restart
+   - FAISS index lives entirely in RAM
+   - Server restart (crash, deploy, code change) wipes all uploaded documents
+   - Frontend may still show a doc name while backend has no knowledge of it
+   - Fix: Persist FAISS to disk OR use a dedicated vector DB (ChromaDB, Qdrant, Weaviate)
+
+[HIGH] 3. Embedding Model Reloaded on Every Upload
+   - get_embeddings() creates a new HuggingFaceEmbeddings instance each call
+   - Loading the model from disk takes 1-3 seconds every time
+   - Fix: Load the model once at module startup and reuse the single instance
+
+[HIGH] 4. PDF Processing Blocks the Entire Server (Sync in Async context)
+   - process_pdf() is a CPU-heavy synchronous function inside an async FastAPI endpoint
+   - While it runs (10-30s for large PDFs), the API cannot handle any other request
+   - Fix: Offload to a background task queue (Celery + Redis), return a job ID immediately
+
+[HIGH] 5. No Real File Validation / No File Size Limit
+   - Only checks .endswith(".pdf") — a renamed .exe passes this check
+   - No file size limit — a 500MB PDF will exhaust server memory and crash
+   - Fix: Validate PDF magic bytes (%PDF), enforce max file size (e.g. 10MB)
+
+[MEDIUM] 6. FAISS Cannot Scale Horizontally
+   - FAISS is single-machine, in-memory only
+   - Two server instances each have their own separate index — users get inconsistent results
+   - Fix: Replace with a dedicated vector DB service (Qdrant, Weaviate, Pinecone)
+
+[MEDIUM] 7. Fixed Chunk Size for All Document Types
+   - chunk_size=800 is hardcoded for every document regardless of structure
+   - Legal contracts, research papers, and manuals need different chunking strategies
+   - Poor chunking = poor retrieval = bad answers
+   - Fix: Semantic chunking or document-aware chunking strategies
+
+[MEDIUM] 8. No Logging / Zero Observability
+   - No logs anywhere in the RAG pipeline
+   - Cannot debug failed uploads, poor retrieval, or embedding errors in production
+   - Fix: Structured logging on every significant operation with context
+
+================================================================================

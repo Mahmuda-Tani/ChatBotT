@@ -16,3 +16,7 @@ sentence-transformers
 pypdf
 faiss-cpu
 numpy
+
+chromadb
+langchain-chroma
+scikit-learn

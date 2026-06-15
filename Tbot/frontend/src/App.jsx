@@ -1,14 +1,31 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import Sidebar from "./components/Sidebar";
 import ChatWidget from "./components/ChatWidget";
+import IndexViewer from "./components/IndexViewer";
 
 export default function App() {
   const [provider, setProvider] = useState("anthropic");
   const [messages, setMessages] = useState([]);
   const [isOpen, setIsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [uploadedDoc, setUploadedDoc] = useState(null); // { filename, page_count, chunk_count }
+  const [uploadedDoc, setUploadedDoc] = useState(null);
   const [useRag, setUseRag] = useState(false);
+  const [isIndexViewerOpen, setIsIndexViewerOpen] = useState(false);
+
+  // On page load: ask the backend if a document is already in ChromaDB.
+  // This restores the sidebar document card after a browser refresh.
+  // The data is safe on disk — only the React state was lost.
+  useEffect(() => {
+    fetch("http://localhost:8000/document")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.filename) {
+          setUploadedDoc(data);
+          setUseRag(true);
+        }
+      })
+      .catch(() => {});
+  }, []);
   const streamBufferRef = useRef("");
   const flushRafRef = useRef(null);
 
@@ -166,12 +183,18 @@ export default function App() {
         onUseRagChange={setUseRag}
         onDocumentUpload={handleDocumentUpload}
         onDocumentRemove={handleDocumentRemove}
+        onViewIndex={() => setIsIndexViewerOpen(true)}
       />
       <main className="flex-1 flex items-center justify-center text-gray-400 text-sm">
         {uploadedDoc
           ? `Chatting with "${uploadedDoc.filename}" — open the widget to ask questions`
           : "Open the chat widget →"}
       </main>
+      <IndexViewer
+        isOpen={isIndexViewerOpen}
+        onClose={() => setIsIndexViewerOpen(false)}
+        uploadedDoc={uploadedDoc}
+      />
       <ChatWidget
         isOpen={isOpen}
         onToggle={() => setIsOpen((o) => !o)}

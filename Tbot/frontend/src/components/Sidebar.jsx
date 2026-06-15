@@ -5,7 +5,7 @@ const PROVIDER_COLORS = {
   anthropic: "bg-orange-500",
 };
 
-function DocumentCard({ doc, onRemove }) {
+function DocumentCard({ doc, onRemove, onViewIndex }) {
   return (
     <div className="bg-gray-800 border border-gray-700 rounded-xl p-3 flex flex-col gap-2">
       <div className="flex items-start justify-between gap-2">
@@ -36,9 +36,21 @@ function DocumentCard({ doc, onRemove }) {
         </button>
       </div>
 
-      <div className="flex items-center gap-1.5">
-        <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-        <span className="text-xs text-green-400 font-medium">RAG active</span>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+          <span className="text-xs text-green-400 font-medium">RAG active</span>
+        </div>
+        <button
+          onClick={onViewIndex}
+          className="text-xs text-gray-400 hover:text-blue-400 transition-colors flex items-center gap-1"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+            <path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" />
+            <path fillRule="evenodd" d="M1.38 8a6.97 6.97 0 0 1 1.2-2.003 7 7 0 1 1 10.84 0A7 7 0 0 1 1.38 8ZM8 3a5 5 0 1 0 0 10A5 5 0 0 0 8 3Z" clipRule="evenodd" />
+          </svg>
+          View Index
+        </button>
       </div>
     </div>
   );
@@ -95,7 +107,7 @@ function UploadZone({ onUpload, isUploading }) {
 export default function Sidebar({
   provider, onProviderChange,
   uploadedDoc, useRag, onUseRagChange,
-  onDocumentUpload, onDocumentRemove,
+  onDocumentUpload, onDocumentRemove, onViewIndex,
 }) {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
@@ -168,7 +180,7 @@ export default function Sidebar({
         </div>
 
         {uploadedDoc ? (
-          <DocumentCard doc={uploadedDoc} onRemove={onDocumentRemove} />
+          <DocumentCard doc={uploadedDoc} onRemove={onDocumentRemove} onViewIndex={onViewIndex} />
         ) : (
           <>
             <p className="text-xs text-gray-500 leading-relaxed">

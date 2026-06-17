@@ -4,7 +4,10 @@ import ChatWidget from "./components/ChatWidget";
 import IndexViewer from "./components/IndexViewer";
 
 export default function App() {
-  const [provider, setProvider] = useState("anthropic");
+  // thread_id identifies this conversation to the LangGraph backend.
+  // Generated once per session; never changes, so useRef (not useState).
+  const threadIdRef = useRef(crypto.randomUUID());
+
   const [messages, setMessages] = useState([]);
   const [isOpen, setIsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -13,8 +16,7 @@ export default function App() {
   const [isIndexViewerOpen, setIsIndexViewerOpen] = useState(false);
 
   // On page load: ask the backend if a document is already in ChromaDB.
-  // This restores the sidebar document card after a browser refresh.
-  // The data is safe on disk — only the React state was lost.
+  // Restores the sidebar document card after a browser refresh.
   useEffect(() => {
     fetch("http://localhost:8000/document")
       .then((r) => r.json())
@@ -26,6 +28,7 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
   const streamBufferRef = useRef("");
   const flushRafRef = useRef(null);
 
@@ -59,17 +62,23 @@ export default function App() {
   }
 
   async function sendMessage(text) {
-    const userMsg = { role: "user", content: text };
-    const updatedMessages = [...messages, userMsg];
     streamBufferRef.current = "";
-    setMessages([...updatedMessages, { role: "assistant", content: "", sources: [] }]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: text },
+      { role: "assistant", content: "", sources: [] },
+    ]);
     setIsLoading(true);
 
     try {
       const res = await fetch("http://localhost:8000/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: updatedMessages, provider, use_rag: useRag }),
+        body: JSON.stringify({
+          thread_id: threadIdRef.current,
+          message: text,
+          use_rag: useRag,
+        }),
       });
 
       if (!res.ok) {
@@ -176,8 +185,6 @@ export default function App() {
   return (
     <div className="flex h-screen bg-gray-50">
       <Sidebar
-        provider={provider}
-        onProviderChange={setProvider}
         uploadedDoc={uploadedDoc}
         useRag={useRag}
         onUseRagChange={setUseRag}

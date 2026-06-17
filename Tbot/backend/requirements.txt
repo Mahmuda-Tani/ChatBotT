@@ -8,9 +8,9 @@ langchain
 langchain-core
 langchain-community
 langchain-text-splitters
-langchain-google-genai
-langchain-anthropic
+langchain-openai
 langchain-huggingface
+langgraph
 sentence-transformers
 
 pypdf
@@ -20,3 +20,5 @@ numpy
 chromadb
 langchain-chroma
 scikit-learn
+tiktoken
+unstructured[pdf]

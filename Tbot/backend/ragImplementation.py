@@ -1,25 +1,26 @@
-import io
+import os
+import tempfile
 
 import chromadb
 import numpy as np
 from langchain_chroma import Chroma
 from langchain_core.documents import Document as LCDocument
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
+from langchain_text_splitters import TokenTextSplitter
 from sklearn.manifold import TSNE
+from unstructured.chunking.title import chunk_by_title
+from unstructured.partition.pdf import partition_pdf
 
-# ── Embedding model — loaded ONCE at startup, reused on every request ─────────
-# Previously this was inside get_embeddings() which reloaded the model each call.
-# Loading a HuggingFace model from disk takes 1-3 seconds.
-# By loading it here (module level), it loads once when uvicorn starts, then stays
-# in memory and is reused for every upload and every search.
+# ── Embedding model — loaded ONCE at startup ──────────────────────────────────
 _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
+# ── Stage 1: Token-aware splitter ─────────────────────────────────────────────
+# chunk_size=256 tokens is deliberately half of all-MiniLM-L6-v2's 512-token
+# limit, leaving headroom for the query vector during retrieval.
+# chunk_overlap=32 tokens ≈ 100-130 characters of repeated context at boundaries.
+_token_splitter = TokenTextSplitter(chunk_size=256, chunk_overlap=32)
+
 # ── ChromaDB persistent client ────────────────────────────────────────────────
-# PersistentClient writes all data to the ./chroma_db/ folder on disk.
-# This means the index survives server restarts, crashes, and redeployments.
-# Unlike FAISS which lived only in RAM.
 _chroma_client = chromadb.PersistentClient(path="./chroma_db")
 COLLECTION_NAME = "active_document"
 
@@ -28,9 +29,6 @@ _doc_info: dict | None = None
 
 
 # ── Startup restoration ───────────────────────────────────────────────────────
-# This runs automatically when the module is imported (i.e. when uvicorn starts).
-# If a collection already exists on disk from a previous run, we reconnect to it
-# so the user can continue chatting without re-uploading their document.
 def _restore_on_startup():
     global _vector_store, _doc_info
     try:
@@ -38,12 +36,9 @@ def _restore_on_startup():
         count = collection.count()
         if count == 0:
             return
-
-        # Recover filename and page range from stored chunk metadata
         all_meta = collection.get(include=["metadatas"])
         filename = all_meta["metadatas"][0].get("source", "Unknown") if all_meta["metadatas"] else "Unknown"
         pages = {m.get("page", 0) for m in all_meta["metadatas"]}
-
         _vector_store = Chroma(
             client=_chroma_client,
             collection_name=COLLECTION_NAME,
@@ -55,7 +50,7 @@ def _restore_on_startup():
             "chunk_count": count,
         }
     except Exception:
-        pass  # No existing collection — fresh start is fine
+        pass
 
 
 _restore_on_startup()
@@ -64,44 +59,81 @@ _restore_on_startup()
 # ── Core RAG functions ────────────────────────────────────────────────────────
 
 def process_pdf(file_bytes: bytes, filename: str) -> dict:
-    """Parse PDF → chunk → embed → store in ChromaDB. Returns doc metadata."""
+    """
+    Two-stage PDF pipeline:
+      Stage 2 — unstructured: structure-aware parsing into typed elements
+      Stage 1 — TokenTextSplitter: split to 256-token chunks aligned to model limit
+    Tables are kept as single chunks (splitting a table destroys its meaning).
+    """
     global _vector_store, _doc_info
 
-    # Delete the previous collection so each upload starts fresh.
-    # In production with multiple users, you would keep all collections and
-    # identify them by session_id instead of deleting.
     try:
         _chroma_client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
 
-    reader = PdfReader(io.BytesIO(file_bytes))
-    page_count = len(reader.pages)
+    # unstructured requires a file path, not raw bytes.
+    # We write to a temp file, process it, then delete it.
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
 
-    raw_pages = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        if text.strip():
-            raw_pages.append({"text": text, "page": i + 1})
+        # ── Stage 2: Structure-aware PDF parsing ──────────────────────────────
+        # strategy="fast" uses pdfminer — no system dependencies (poppler/tesseract).
+        # Returns typed elements: Title, NarrativeText, Table, ListItem, etc.
+        elements = partition_pdf(tmp_path, strategy="fast")
 
-    if not raw_pages:
-        raise ValueError("Could not extract text from PDF")
+        if not elements:
+            raise ValueError("Could not extract content from PDF")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+        # Recover page count from element metadata
+        page_numbers = [
+            el.metadata.page_number
+            for el in elements
+            if el.metadata.page_number is not None
+        ]
+        page_count = max(page_numbers) if page_numbers else 0
+
+        # Group elements by section/title boundary.
+        # max_characters=1200 keeps related content together before token splitting.
+        section_chunks = chunk_by_title(elements, max_characters=1200)
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # ── Stage 1: Token-aware splitting ───────────────────────────────────────
     lc_docs = []
-    for page in raw_pages:
-        for chunk in splitter.split_text(page["text"]):
-            lc_docs.append(
-                LCDocument(
-                    page_content=chunk,
-                    metadata={"page": page["page"], "source": filename},
-                )
-            )
 
-    # Chroma.from_documents() handles:
-    # 1. Creating the collection in ChromaDB
-    # 2. Embedding each chunk via _embeddings
-    # 3. Writing vectors + text + metadata to disk
+    for section in section_chunks:
+        text = (section.text or "").strip()
+        if not text:
+            continue
+
+        page = getattr(section.metadata, "page_number", 1) or 1
+        category = getattr(section.metadata, "category", "NarrativeText") or "NarrativeText"
+
+        if category == "Table":
+            # Tables must not be split — a partial table row is meaningless.
+            lc_docs.append(LCDocument(
+                page_content=text,
+                metadata={"page": page, "source": filename, "category": category},
+            ))
+            continue
+
+        # All other element types: split into token-aligned chunks
+        for sub in _token_splitter.split_text(text):
+            if sub.strip():
+                lc_docs.append(LCDocument(
+                    page_content=sub.strip(),
+                    metadata={"page": page, "source": filename, "category": category},
+                ))
+
+    if not lc_docs:
+        raise ValueError("No content could be extracted from this PDF")
+
     _vector_store = Chroma.from_documents(
         documents=lc_docs,
         embedding=_embeddings,
@@ -150,8 +182,7 @@ def get_all_chunks() -> list[dict]:
 
     collection = _chroma_client.get_collection(COLLECTION_NAME)
     result = collection.get(include=["documents", "metadatas", "embeddings"])
-
-    raw_embeddings = result.get("embeddings")  # may be None or a list of arrays
+    raw_embeddings = result.get("embeddings")
 
     chunks = []
     for i in range(len(result["ids"])):
@@ -162,7 +193,6 @@ def get_all_chunks() -> list[dict]:
             "page": result["metadatas"][i].get("page", "?"),
             "source": result["metadatas"][i].get("source", ""),
             "metadata": result["metadatas"][i],
-            # Send only first 16 values — showing all 384 per chunk in JSON is too large
             "embedding_preview": [round(float(v), 4) for v in embedding[:16]],
             "embedding_dims": len(embedding),
         })
@@ -172,10 +202,7 @@ def get_all_chunks() -> list[dict]:
 
 
 def get_vectors_2d() -> list[dict]:
-    """
-    Pull all stored embeddings from ChromaDB, compress from 384 dimensions to 2
-    using t-SNE, and return plottable (x, y) coordinates with chunk metadata.
-    """
+    """Compress stored embeddings to 2D via t-SNE for scatter plot visualization."""
     if _vector_store is None:
         return []
 
@@ -188,9 +215,6 @@ def get_vectors_2d() -> list[dict]:
 
     vectors = np.array(embeddings)
     n_samples = len(vectors)
-
-    # t-SNE requires perplexity < number of samples.
-    # Default perplexity is 30 — reduce it for small documents.
     perplexity = min(30, n_samples - 1)
 
     tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
@@ -202,6 +226,7 @@ def get_vectors_2d() -> list[dict]:
             "y": round(float(coords[i][1]), 4),
             "text": result["documents"][i][:200],
             "page": result["metadatas"][i].get("page", 0),
+            "category": result["metadatas"][i].get("category", ""),
         }
         for i in range(n_samples)
     ]

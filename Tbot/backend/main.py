@@ -5,24 +5,35 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from graph import build_graph
 from ragImplementation import (
     clear_document,
     get_all_chunks,
     get_doc_info,
     get_vectors_2d,
     process_pdf,
-    retrieve_context,
 )
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-haiku-4-5")
+
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
+
+_llm = ChatOpenAI(
+    model=OPENROUTER_MODEL,
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+)
+
+# Compiled once at startup; reused across all requests.
+_graph = build_graph(_llm)
 
 app = FastAPI()
 
@@ -36,53 +47,10 @@ app.add_middleware(
 
 # ---------- Models ----------
 
-class Message(BaseModel):
-    role: str
-    content: str
-
-
 class ChatRequest(BaseModel):
-    messages: list[Message]
-    provider: str
+    thread_id: str
+    message: str
     use_rag: bool = False
-
-
-# ---------- Helpers ----------
-
-def get_llm(provider: str):
-    if provider == "gemini":
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not set in .env")
-        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
-    if provider == "anthropic":
-        if not ANTHROPIC_API_KEY:
-            raise ValueError("ANTHROPIC_API_KEY is not set in .env")
-        return ChatAnthropic(model="claude-sonnet-4-6", anthropic_api_key=ANTHROPIC_API_KEY)
-    raise ValueError(f"Unknown provider: {provider}")
-
-
-def to_langchain_messages(messages: list[Message]):
-    role_map = {"user": HumanMessage, "assistant": AIMessage, "system": SystemMessage}
-    result = []
-    for msg in messages:
-        cls = role_map.get(msg.role)
-        if cls is None:
-            raise ValueError(f"Unknown role: {msg.role}")
-        result.append(cls(content=msg.content))
-    return result
-
-
-def extract_text(chunk) -> str:
-    content = chunk.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            b if isinstance(b, str) else b.get("text", "")
-            for b in content
-            if isinstance(b, (str, dict))
-        )
-    return str(content) if content else ""
 
 
 # ---------- Routes ----------
@@ -111,83 +79,65 @@ async def delete_document():
 
 
 # ---------- Debug / Inspection Routes ----------
-# These endpoints expose the internals of the ChromaDB index.
-# They are read-only — they never modify the stored data.
-# Use them to inspect chunk quality, spot bad splits, and understand
-# what the LLM will search through when a question is asked.
 
 @app.get("/debug/chunks")
 async def debug_chunks():
-    """
-    Returns every chunk stored in ChromaDB with its text, page number,
-    and position in the index. Use this to verify chunking quality.
-    """
     chunks = get_all_chunks()
-    return {
-        "total": len(chunks),
-        "chunks": chunks,
-    }
+    return {"total": len(chunks), "chunks": chunks}
 
 
 @app.get("/debug/vectors")
 async def debug_vectors():
-    """
-    Pulls all stored embeddings from ChromaDB, compresses them from
-    384 dimensions to 2 using t-SNE, and returns (x, y) coordinates
-    for each chunk so the frontend can render a scatter plot.
-
-    Note: t-SNE is non-trivial to compute. For large documents (500+ chunks)
-    this endpoint may take several seconds to respond.
-    """
     try:
         points = get_vectors_2d()
-        return {
-            "total": len(points),
-            "points": points,
-        }
+        return {"total": len(points), "points": points}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------- Chat ----------
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    try:
-        if not req.messages:
-            raise ValueError("messages cannot be empty")
+    config = {"configurable": {"thread_id": req.thread_id}}
+    graph_input = {
+        "messages": [HumanMessage(content=req.message)],
+        "use_rag": req.use_rag,
+        "sources": [],
+    }
 
-        llm = get_llm(req.provider)
-        lc_messages = to_langchain_messages(req.messages)
-        sources = []
+    async def generate():
+        try:
+            # Emit sources from the retrieve node before streaming text
+            sources_sent = False
 
-        if req.use_rag:
-            query = req.messages[-1].content
-            context, sources = retrieve_context(query)
-            system_msg = SystemMessage(
-                content=(
-                    "You are a helpful assistant. Answer using ONLY the document context below. "
-                    "If the answer is not in the context, say so clearly.\n\n"
-                    f"DOCUMENT CONTEXT:\n{context}"
-                )
-            )
-            lc_messages = [system_msg] + lc_messages
+            async for event in _graph.astream_events(graph_input, config=config, version="v2"):
+                kind = event["event"]
 
-        def generate():
-            try:
-                if sources:
-                    yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
-                for chunk in llm.stream(lc_messages):
-                    text = extract_text(chunk)
-                    if text:
-                        yield f"data: {json.dumps({'type': 'text', 'text': text})}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+                # Capture sources emitted by retrieve_node
+                if kind == "on_node_end" and event["name"] == "retrieve":
+                    sources = event["data"]["output"].get("sources", [])
+                    if sources and not sources_sent:
+                        yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+                        sources_sent = True
 
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-        )
+                # Stream LLM tokens from the generate node only
+                if kind == "on_chat_model_stream" and event.get("metadata", {}).get("langgraph_node") == "generate":
+                    token = event["data"]["chunk"].content
+                    if token:
+                        yield f"data: {json.dumps({'type': 'text', 'text': token})}\n\n"
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
